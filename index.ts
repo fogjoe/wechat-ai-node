@@ -3,12 +3,18 @@ import crypto from 'crypto';
 import { parseStringPromise } from 'xml2js';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import nodemailer from 'nodemailer';
 
 dotenv.config();
 
 const PORT: number = parseInt(process.env.PORT ?? '3006', 10);
 const WECHAT_TOKEN: string = process.env.WECHAT_TOKEN ?? '';
 const OPENROUTER_API_KEY: string = process.env.OPENROUTER_API_KEY ?? '';
+const SUPABASE_URL: string = normalizeSupabaseUrl(process.env.SUPABASE_URL ?? '');
+const SUPABASE_SERVICE_ROLE_KEY: string = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+const SMTP_USER: string = process.env.SMTP_USER ?? '';
+const SMTP_APP_PASSWORD: string = process.env.SMTP_APP_PASSWORD ?? '';
 const VOCAB_SYSTEM_PROMPT = `You are a trilingual vocabulary assistant.
 The user will give you a word or phrase in any language.
 Analyze the exact input term as a complete lexical item. Do not replace it with a synonym, root word, component character, or related adjective.
@@ -38,6 +44,14 @@ if (!OPENROUTER_API_KEY) {
   console.warn('OPENROUTER_API_KEY is not set; LLM features will be unavailable.');
 }
 
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn('Supabase environment variables are not set; email binding and reports will be unavailable.');
+}
+
+if (!SMTP_USER || !SMTP_APP_PASSWORD) {
+  console.warn('SMTP environment variables are not set; email reports will be unavailable.');
+}
+
 const app = express();
 const openai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
@@ -48,6 +62,44 @@ const openai = new OpenAI({
     'X-Title': 'WeChat-Mac-Mini-Bot',
   },
 });
+const supabase: SupabaseClient | null =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
+const mailTransporter =
+  SMTP_USER && SMTP_APP_PASSWORD
+    ? nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: SMTP_USER,
+          pass: SMTP_APP_PASSWORD,
+        },
+      })
+    : null;
+
+function normalizeSupabaseUrl(rawUrl: string): string {
+  const trimmedUrl = rawUrl.trim();
+
+  if (!trimmedUrl) {
+    return '';
+  }
+
+  try {
+    const url = new URL(trimmedUrl);
+    const normalizedPath = url.pathname.replace(/\/+$/, '');
+
+    if (normalizedPath === '/rest/v1') {
+      url.pathname = '';
+      url.search = '';
+      url.hash = '';
+      return url.toString().replace(/\/$/, '');
+    }
+
+    return trimmedUrl.replace(/\/$/, '');
+  } catch {
+    return trimmedUrl;
+  }
+}
 
 app.use((req, _res, next) => {
   console.log(`Incoming request: ${req.method} ${req.originalUrl}`);
@@ -76,6 +128,15 @@ interface ParsedWeChatEnvelope {
 interface ReplyTarget {
   toUser: string;
   fromUser: string;
+}
+
+interface VocabLogRow {
+  category?: string | null;
+  word?: string | null;
+  term?: string | null;
+  content?: string | null;
+  definition?: string | null;
+  created_at?: string | null;
 }
 
 // ---------- Helpers ----------
@@ -175,6 +236,171 @@ async function createReplyContent(content: string): Promise<string> {
   }
 }
 
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+async function bindUserEmail(wechatUid: string, email: string): Promise<string> {
+  if (!supabase) {
+    return 'Email binding is unavailable because Supabase is not configured.';
+  }
+
+  if (!isValidEmail(email)) {
+    return 'Invalid email address. Please use #email your@email.com';
+  }
+
+  const { data: updatedRows, error: updateError } = await supabase
+    .from('users')
+    .update({ email })
+    .eq('wechat_uid', wechatUid)
+    .select('wechat_uid');
+
+  if (updateError) {
+    console.error('Failed to update bound email:', updateError);
+    return 'Failed to bind your email. Please try again later.';
+  }
+
+  if ((updatedRows ?? []).length === 0) {
+    const { error: insertError } = await supabase.from('users').insert({
+      wechat_uid: wechatUid,
+      email,
+    });
+
+    if (insertError) {
+      console.error('Failed to insert bound email:', insertError);
+      return 'Failed to bind your email. Please try again later.';
+    }
+  }
+
+  return `Email bound successfully: ${email}`;
+}
+
+async function getBoundEmail(wechatUid: string): Promise<string | null> {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('users')
+    .select('email')
+    .eq('wechat_uid', wechatUid)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Failed to fetch bound email:', error);
+    return null;
+  }
+
+  return typeof data?.email === 'string' && data.email.length > 0 ? data.email : null;
+}
+
+function buildVocabReportHtml(rows: VocabLogRow[]): string {
+  const groupedRows = rows.reduce<Map<string, VocabLogRow[]>>((groups, row) => {
+    const category = row.category?.trim() || 'Uncategorized';
+    const currentRows = groups.get(category) ?? [];
+    currentRows.push(row);
+    groups.set(category, currentRows);
+    return groups;
+  }, new Map<string, VocabLogRow[]>());
+
+  const sections = Array.from(groupedRows.entries())
+    .map(([category, categoryRows]) => {
+      const items = categoryRows
+        .map((row) => {
+          const word = row.word ?? row.term ?? row.content ?? 'Untitled';
+          const definition = row.definition ?? '';
+          const createdAt = row.created_at ? `<small>${escapeHtml(row.created_at)}</small>` : '';
+
+          return `<li><strong>${escapeHtml(word)}</strong>${definition ? `: ${escapeHtml(definition)}` : ''}${createdAt ? `<br>${createdAt}` : ''}</li>`;
+        })
+        .join('');
+
+      return `<h2>${escapeHtml(category)}</h2><ul>${items}</ul>`;
+    })
+    .join('');
+
+  return `<!doctype html>
+<html>
+  <body>
+    <h1>Vocabulary Report</h1>
+    ${sections || '<p>No vocabulary records found.</p>'}
+  </body>
+</html>`;
+}
+
+async function sendVocabReportEmail(wechatUid: string, email: string): Promise<void> {
+  if (!supabase || !mailTransporter || !SMTP_USER) {
+    console.error('Cannot send report because Supabase or SMTP is not configured.');
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from('vocab_logs')
+    .select('*')
+    .eq('wechat_uid', wechatUid)
+    .order('category', { ascending: true });
+
+  if (error) {
+    console.error('Failed to fetch vocabulary logs:', error);
+    return;
+  }
+
+  const html = buildVocabReportHtml((data ?? []) as VocabLogRow[]);
+
+  await mailTransporter.sendMail({
+    from: SMTP_USER,
+    to: email,
+    subject: 'Your Vocabulary Report',
+    html,
+  });
+}
+
+async function startVocabReport(wechatUid: string): Promise<string> {
+  if (!supabase) {
+    return 'Report generation is unavailable because Supabase is not configured.';
+  }
+
+  if (!mailTransporter) {
+    return 'Email reports are unavailable because SMTP is not configured.';
+  }
+
+  const email = await getBoundEmail(wechatUid);
+
+  if (!email) {
+    return 'No email is bound. Please use #email your@email.com first.';
+  }
+
+  void sendVocabReportEmail(wechatUid, email).catch((err) => {
+    console.error('Failed to send vocabulary report email:', err);
+  });
+
+  return 'Your report is being generated and sent to your email';
+}
+
+async function handleTextCommand(content: string, wechatUid: string): Promise<string> {
+  const normalizedContent = content.trim();
+
+  if (normalizedContent.startsWith('#email ')) {
+    const email = normalizedContent.slice('#email '.length).trim();
+    return bindUserEmail(wechatUid, email);
+  }
+
+  if (normalizedContent === '#report') {
+    return startVocabReport(wechatUid);
+  }
+
+  return createReplyContent(content);
+}
+
 // ---------- Routes ----------
 
 app.get('/', (_req: Request, res: Response): void => {
@@ -256,7 +482,7 @@ app.post('/wechat', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const replyContent = await createReplyContent(message.Content);
+    const replyContent = await handleTextCommand(message.Content, message.FromUserName);
     const replyXml = buildTextReply(message.FromUserName, message.ToUserName, replyContent);
 
     res.set('Content-Type', 'application/xml');
